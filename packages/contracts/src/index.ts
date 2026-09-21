@@ -25,6 +25,21 @@ export type MovementType = (typeof movementTypes)[number];
 export const projectStatuses = ["PLANNED", "IN_PROGRESS", "COMPLETED", "ARCHIVED"] as const;
 export type ProjectStatus = (typeof projectStatuses)[number];
 
+export const projectStatusRank: Record<ProjectStatus, number> = {
+  PLANNED: 0,
+  IN_PROGRESS: 1,
+  COMPLETED: 2,
+  ARCHIVED: 3
+};
+
+export const projectTransitionKinds = ["FORWARD", "ROLLBACK", "SAME"] as const;
+export type ProjectTransitionKind = (typeof projectTransitionKinds)[number];
+
+export function classifyProjectTransition(from: ProjectStatus, to: ProjectStatus): ProjectTransitionKind {
+  if (from === to) return "SAME";
+  return projectStatusRank[to] < projectStatusRank[from] ? "ROLLBACK" : "FORWARD";
+}
+
 export const colorChangeTypes = [
   "OXIDATION",
   "DYE_BATH",
@@ -205,6 +220,12 @@ export const requirementInputSchema = z.object({
   notes: z.string().trim().max(2000).nullable().optional()
 });
 
+export const requirementPatchSchema = requirementInputSchema.partial().extend({
+  version: z.number().int().positive()
+});
+
+export const rollbackReasonSchema = z.string().trim().min(3, "回退原因至少需要 3 个字符").max(1000);
+
 export const consumptionInputSchema = z.object({
   projectId: z.string().uuid(),
   projectRequirementId: z.string().uuid().nullable().optional(),
@@ -250,7 +271,8 @@ export const reverseConsumptionSchema = z.object({
 
 export const projectStatusSchema = z.object({
   status: z.enum(projectStatuses),
-  version: z.number().int().positive()
+  version: z.number().int().positive(),
+  reason: rollbackReasonSchema.nullable().optional()
 });
 
 export type Pagination = {

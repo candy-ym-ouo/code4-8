@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { classifyProjectTransition, type ProjectStatus } from "@handcraft/contracts";
 import { request, ApiError } from "@/lib/api";
 import { craftTypeLabels, statusLabels, type Material } from "@/types";
 import AttachmentPanel from "@/components/AttachmentPanel.vue";
@@ -53,8 +54,21 @@ async function deleteRequirement(id: string) {
 async function changeStatus(status: string) {
   const label = statusLabels[status] || status;
   try {
-    if (status === "COMPLETED") await ElMessageBox.confirm("完成后项目默认只读，重新打开后才能继续消耗。", "完成项目", { type: "warning" });
-    await request(`/projects/${project.value.id}/status`, { method: "POST", body: { status, version: project.value.version } });
+    let reason: string | undefined;
+    const kind = classifyProjectTransition(project.value.status as ProjectStatus, status as ProjectStatus);
+    if (kind === "ROLLBACK") {
+      const result = await ElMessageBox.prompt(`回退到「${label}」必须填写回退原因，会记录在状态流转历史中。`, "回退项目状态", {
+        type: "warning",
+        confirmButtonText: "确认回退",
+        cancelButtonText: "取消",
+        inputPlaceholder: "例如：客户追加需求，需要继续消耗材料",
+        inputValidator: (value) => (value && value.trim().length >= 3) || "回退原因至少需要 3 个字符"
+      });
+      reason = result.value.trim();
+    } else if (status === "COMPLETED") {
+      await ElMessageBox.confirm("完成后项目默认只读，重新打开后才能继续消耗。", "完成项目", { type: "warning" });
+    }
+    await request(`/projects/${project.value.id}/status`, { method: "POST", body: { status, version: project.value.version, ...(reason ? { reason } : {}) } });
     ElMessage.success(`项目状态已更新为${label}`); await load();
   } catch (error: any) { if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof ApiError ? error.message : "状态更新失败"); }
 }
@@ -115,6 +129,18 @@ onMounted(load);
           <h2>项目颜色变化</h2>
           <el-timeline v-if="project.colorChanges.length"><el-timeline-item v-for="item in project.colorChanges" :key="item.id" :timestamp="new Date(item.occurredAt).toLocaleString()"><strong>{{ item.beforeColorName || "未记录" }} → {{ item.afterColorName }}</strong></el-timeline-item></el-timeline>
           <el-empty v-else description="还没有关联颜色变化" />
+        </section>
+        <section class="panel">
+          <h2>状态流转记录</h2>
+          <el-timeline v-if="project.statusTransitions?.length">
+            <el-timeline-item v-for="item in project.statusTransitions" :key="item.id" :timestamp="new Date(item.createdAt).toLocaleString()">
+              <strong>{{ statusLabels[item.fromStatus] || item.fromStatus }} → {{ statusLabels[item.toStatus] || item.toStatus }}</strong>
+              <el-tag size="small" :type="item.triggerType==='AUTO'?'warning':'info'" style="margin-left:8px">{{ item.triggerType==='AUTO' ? "自动推进" : "手动" }}</el-tag>
+              <div v-if="item.reason" class="muted">回退原因：{{ item.reason }}</div>
+              <div class="muted">操作人：{{ item.actorName }}</div>
+            </el-timeline-item>
+          </el-timeline>
+          <el-empty v-else description="还没有状态流转记录" />
         </section>
       </div>
     </template>

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { convertQuantity, projectInputSchema, projectStatusSchema, requirementInputSchema } from "@handcraft/contracts";
+import { classifyProjectTransition, convertQuantity, projectInputSchema, projectStatusSchema, requirementInputSchema, requirementPatchSchema } from "@handcraft/contracts";
 import type { AuthenticatedRequest } from "../lib/auth.js";
 import { pool, withTransaction } from "../lib/db.js";
 import { AppError } from "../lib/errors.js";
@@ -10,7 +10,6 @@ import { writeAudit } from "../lib/audit.js";
 
 type Query = Record<string, string | undefined>;
 const projectPatchSchema = projectInputSchema.partial().extend({ version: z.number().int().positive() });
-const requirementPatchSchema = requirementInputSchema.partial().extend({ version: z.number().int().positive().optional() });
 
 function dateOnly(value: unknown): string | null {
   if (value === null || value === undefined) return null;
@@ -67,6 +66,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       `SELECT id, name, craft_type AS "craftType", status, start_date AS "startDate", due_date AS "dueDate",
               completed_at AS "completedAt", description, target_color_name AS "targetColorName",
               target_color_hex AS "targetColorHex", tags, archived_at AS "archivedAt",
+              auto_started_at AS "autoStartedAt",
               created_at AS "createdAt", updated_at AS "updatedAt", version
          FROM projects WHERE id = $1`,
       [request.params.id]
@@ -75,6 +75,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const requirements = await pool.query(
       `SELECT r.id, r.material_id AS "materialId", m.name AS "materialName", m.stock_unit AS "materialStockUnit",
               r.required_quantity::text AS "requiredQuantity", r.stock_unit AS "stockUnit", r.purpose, r.notes,
+              r.version,
               coalesce(sum(c.total_quantity) FILTER (WHERE c.status = 'ACTIVE'), 0)::text AS "actualQuantity",
               coalesce(sum(c.used_quantity) FILTER (WHERE c.status = 'ACTIVE'), 0)::text AS "usedQuantity",
               coalesce(sum(c.waste_quantity) FILTER (WHERE c.status = 'ACTIVE'), 0)::text AS "wasteQuantity",
@@ -85,7 +86,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         WHERE r.project_id = $1 GROUP BY r.id, m.name, m.stock_unit ORDER BY r.created_at`,
       [request.params.id]
     );
-    const [consumptions, colors, attachments] = await Promise.all([
+    const [consumptions, colors, attachments, statusTransitions] = await Promise.all([
       pool.query(
         `SELECT c.id, c.batch_id AS "batchId", b.batch_code AS "batchCode", m.name AS "materialName",
                 c.used_quantity::text AS "usedQuantity", c.waste_quantity::text AS "wasteQuantity",
@@ -109,9 +110,16 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         `SELECT id, original_name AS "originalName", mime_type AS "mimeType", byte_size::text AS "byteSize", created_at AS "createdAt"
            FROM attachments WHERE owner_type = 'PROJECT' AND owner_id = $1 ORDER BY created_at DESC`,
         [request.params.id]
+      ),
+      pool.query(
+        `SELECT t.id, t.from_status AS "fromStatus", t.to_status AS "toStatus", t.trigger_type AS "triggerType",
+                t.reason, t.created_at AS "createdAt", u.display_name AS "actorName"
+           FROM project_status_transitions t JOIN users u ON u.id = t.actor_user_id
+          WHERE t.project_id = $1 ORDER BY t.created_at DESC, t.id DESC`,
+        [request.params.id]
       )
     ]);
-    return { data: { ...project.rows[0], requirements: requirements.rows, consumptions: consumptions.rows, colorChanges: colors.rows, attachments: attachments.rows } };
+    return { data: { ...project.rows[0], requirements: requirements.rows, consumptions: consumptions.rows, colorChanges: colors.rows, attachments: attachments.rows, statusTransitions: statusTransitions.rows } };
   });
 
   app.post("/projects", async (request, reply) => {
@@ -191,10 +199,27 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const old = before.rows[0];
       if (!old) throw new AppError(404, "NOT_FOUND", "项目不存在");
       if (old.version !== input.version) throw new AppError(409, "VERSION_CONFLICT", "项目已被其他操作修改，请刷新后重试");
-      if (old.status === input.status) return { data: old };
-      if (old.status === "ARCHIVED" && input.status !== "ARCHIVED") throw new AppError(409, "PROJECT_ARCHIVED", "已归档项目不能直接重新打开");
+      const transitionKind = classifyProjectTransition(old.status, input.status);
+      if (transitionKind === "SAME") return { data: old };
+      if (old.status === "ARCHIVED") throw new AppError(409, "PROJECT_ARCHIVED", "已归档项目不能直接重新打开");
       if (input.status === "ARCHIVED" && old.status === "IN_PROGRESS") {
         throw new AppError(409, "PROJECT_IN_PROGRESS", "进行中的项目不能归档");
+      }
+      if (transitionKind === "ROLLBACK") {
+        if (!input.reason) {
+          throw new AppError(422, "ROLLBACK_REASON_REQUIRED", "回退状态必须填写回退原因（至少 3 个字符）", { reason: ["回退原因至少需要 3 个字符"] });
+        }
+      } else {
+        // 阶段门：从计划中进入进行中（或更后阶段）前，必须至少有一条材料需求
+        if (old.status === "PLANNED" && ["IN_PROGRESS", "COMPLETED"].includes(input.status)) {
+          const requirement = await client.query("SELECT 1 FROM project_requirements WHERE project_id = $1 LIMIT 1", [request.params.id]);
+          if (!requirement.rowCount) throw new AppError(409, "GATE_REQUIREMENTS_MISSING", "阶段门未通过：请先为项目添加至少一条材料需求");
+        }
+        // 阶段门：完成项目前，必须至少有一条未撤销的实际消耗
+        if (input.status === "COMPLETED") {
+          const consumption = await client.query("SELECT 1 FROM consumptions WHERE project_id = $1 AND status = 'ACTIVE' LIMIT 1", [request.params.id]);
+          if (!consumption.rowCount) throw new AppError(409, "GATE_CONSUMPTIONS_MISSING", "阶段门未通过：项目还没有有效的实际消耗记录");
+        }
       }
       if (["IN_PROGRESS", "COMPLETED"].includes(input.status)) {
         const startDate = dateOnly(old.start_date);
@@ -215,6 +240,11 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
          WHERE id = $2 RETURNING *`,
         [input.status, request.params.id]
       );
+      await client.query(
+        `INSERT INTO project_status_transitions(project_id, from_status, to_status, trigger_type, reason, actor_user_id)
+         VALUES ($1, $2::project_status, $3::project_status, 'MANUAL', $4, $5)`,
+        [request.params.id, old.status, input.status, input.reason ?? null, user.id]
+      );
       await writeAudit(client, { actorUserId: user.id, action: "STATUS", entityType: "PROJECT", entityId: request.params.id, beforeData: old, afterData: result.rows[0], requestId: request.id });
       return { data: result.rows[0] };
     });
@@ -228,6 +258,11 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (before.rows[0].status === "ARCHIVED") return { data: before.rows[0] };
       if (before.rows[0].status === "IN_PROGRESS") throw new AppError(409, "PROJECT_IN_PROGRESS", "进行中的项目不能归档");
       const result = await client.query("UPDATE projects SET status = 'ARCHIVED', archived_at = now(), version = version + 1 WHERE id = $1 RETURNING *", [request.params.id]);
+      await client.query(
+        `INSERT INTO project_status_transitions(project_id, from_status, to_status, trigger_type, actor_user_id)
+         VALUES ($1, $2::project_status, 'ARCHIVED', 'MANUAL', $3)`,
+        [request.params.id, before.rows[0].status, user.id]
+      );
       await writeAudit(client, { actorUserId: user.id, action: "ARCHIVE", entityType: "PROJECT", entityId: request.params.id, afterData: result.rows[0], requestId: request.id });
       return { data: result.rows[0] };
     });
@@ -272,6 +307,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const before = await client.query("SELECT * FROM project_requirements WHERE id = $1 AND project_id = $2 FOR UPDATE", [request.params.requirementId, request.params.id]);
       const old = before.rows[0];
       if (!old) throw new AppError(404, "NOT_FOUND", "材料需求不存在");
+      if (old.version !== input.version) throw new AppError(409, "VERSION_CONFLICT", "材料需求已被其他操作修改，请刷新后重试");
       const materialId = input.materialId ?? old.material_id;
       const materialChanged = materialId !== old.material_id;
       if (materialChanged) {
@@ -301,7 +337,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const result = await client.query(
         `UPDATE project_requirements SET material_id = $1, required_quantity = $2, stock_unit = $3::stock_unit,
           purpose = CASE WHEN $4::boolean THEN $5 ELSE purpose END,
-          notes = CASE WHEN $6::boolean THEN $7 ELSE notes END
+          notes = CASE WHEN $6::boolean THEN $7 ELSE notes END,
+          version = version + 1
          WHERE id = $8 RETURNING *`,
         [materialId, requiredQuantity, material.rows[0].stock_unit, "purpose" in input, input.purpose || null, "notes" in input, input.notes || null, request.params.requirementId]
       );

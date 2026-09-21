@@ -89,6 +89,16 @@ export type Project = {
   updatedAt: string;
 };
 
+export type ProjectStatusTransition = {
+  id: string;
+  fromStatus: string;
+  toStatus: string;
+  triggerType: "MANUAL" | "AUTO";
+  reason: string | null;
+  actorName: string;
+  createdAt: string;
+};
+
 export type Consumption = {
   id: string;
   projectId: string;

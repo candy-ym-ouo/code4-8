@@ -100,8 +100,8 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
         if (existing.rows[0]) return { ...existing.rows[0], idempotent: true };
       }
 
-      const project = await client.query<{ id: string; name: string; status: string; version: number; start_date: string | null; due_date: string | null }>(
-        "SELECT id, name, status, version, start_date, due_date FROM projects WHERE id = $1 FOR UPDATE",
+      const project = await client.query<{ id: string; name: string; status: string; version: number; start_date: string | null; due_date: string | null; auto_started_at: string | null }>(
+        "SELECT id, name, status, version, start_date, due_date, auto_started_at FROM projects WHERE id = $1 FOR UPDATE",
         [input.projectId]
       );
       if (!project.rows[0]) throw new AppError(422, "INVALID_PROJECT", "项目不存在");
@@ -110,6 +110,9 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
       }
       let autoStartedProject = false;
       if (project.rows[0].status === "PLANNED") {
+        if (project.rows[0].auto_started_at) {
+          throw new AppError(409, "AUTO_START_ALREADY_USED", "该项目已自动推进过一次，请手动开始项目后再记录消耗");
+        }
         if (!project.rows[0].start_date && project.rows[0].due_date) {
           const today = await client.query<{ today: string }>("SELECT current_date::text AS today");
           if (project.rows[0].due_date < (today.rows[0]?.today ?? project.rows[0].due_date)) {
@@ -118,10 +121,15 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
         }
         const started = await client.query(
           `UPDATE projects SET status = 'IN_PROGRESS', start_date = coalesce(start_date, current_date),
-             version = version + 1 WHERE id = $1 RETURNING *`,
+             auto_started_at = now(), version = version + 1 WHERE id = $1 RETURNING *`,
           [input.projectId]
         );
         autoStartedProject = true;
+        await client.query(
+          `INSERT INTO project_status_transitions(project_id, from_status, to_status, trigger_type, actor_user_id)
+           VALUES ($1, 'PLANNED', 'IN_PROGRESS', 'AUTO', $2)`,
+          [input.projectId, user.id]
+        );
         await writeAudit(client, {
           actorUserId: user.id,
           action: "AUTO_START",

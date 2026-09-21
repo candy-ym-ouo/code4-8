@@ -145,11 +145,28 @@
 | --- | --- | --- |
 | GET/POST | `/projects` | 查询或创建项目 |
 | GET/PATCH | `/projects/:id` | 详情或更新 |
-| POST | `/projects/:id/status` | 更新状态 |
+| POST | `/projects/:id/status` | 更新状态（阶段门、回退原因） |
 | POST | `/projects/:id/archive` | 归档 |
 | POST | `/projects/:id/requirements` | 添加材料需求 |
-| PATCH | `/projects/:id/requirements/:requirementId` | 更新需求 |
+| PATCH | `/projects/:id/requirements/:requirementId` | 更新需求（必须携带 `version`） |
 | DELETE | `/projects/:id/requirements/:requirementId` | 删除未使用需求 |
+
+项目状态流转：
+
+- 状态方向固定为 `PLANNED → IN_PROGRESS → COMPLETED → ARCHIVED`，反向移动属于回退。
+- 阶段门：开始项目前必须至少有一条材料需求（`GATE_REQUIREMENTS_MISSING`）；完成项目前必须至少有一条未撤销的实际消耗（`GATE_CONSUMPTIONS_MISSING`）。
+- 回退（如 `COMPLETED → IN_PROGRESS`）必须携带至少 3 个字符的 `reason`（`ROLLBACK_REASON_REQUIRED`）。
+- 每次流转都会写入状态流转记录，项目详情的 `statusTransitions` 字段返回流转方向、触发方式（`MANUAL`/`AUTO`）、回退原因、操作人和时间。
+- 已完成或已归档项目不能新增、修改或删除材料需求（`PROJECT_READ_ONLY`）。
+- 更新需求必须携带需求的 `version`，版本不一致返回 `VERSION_CONFLICT`。
+
+```json
+{
+  "status": "IN_PROGRESS",
+  "version": 3,
+  "reason": "客户追加需求，需要继续消耗材料"
+}
+```
 
 材料需求：
 
@@ -170,7 +187,7 @@
 | GET | `/consumptions/:id` | 消耗详情 |
 | POST | `/consumptions/:id/reverse` | 撤销 |
 
-首次为计划中的项目创建消耗时，项目会自动转为 `IN_PROGRESS` 并记录审计日志。
+首次为计划中的项目创建消耗时，项目会自动转为 `IN_PROGRESS` 并记录审计日志与 `AUTO` 流转记录。自动推进每个项目只触发一次；项目退回 `PLANNED` 后再记录消耗会返回 `AUTO_START_ALREADY_USED`，需要先手动开始项目。
 
 创建消耗：
 

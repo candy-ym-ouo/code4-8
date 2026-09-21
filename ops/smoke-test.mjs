@@ -27,6 +27,25 @@ async function call(path, options = {}) {
   return (await callWithStatus(path, options)).data;
 }
 
+async function callRaw(path, options = {}) {
+  const headers = new Headers(options.headers);
+  if (cookie) headers.set("cookie", cookie);
+  if (options.body !== undefined) headers.set("content-type", "application/json");
+  const response = await fetch(`${baseUrl}/api/v1${path}`, {
+    ...options,
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body)
+  });
+  const payload = response.status === 204 ? null : await response.json();
+  return { status: response.status, payload };
+}
+
+async function expectError(path, options, expectedStatus, expectedCode) {
+  const { status, payload } = await callRaw(path, options);
+  assert(status === expectedStatus, `${options.method ?? "GET"} ${path} expected HTTP ${expectedStatus}, got ${status}: ${JSON.stringify(payload)}`);
+  assert(payload?.error?.code === expectedCode, `${options.method ?? "GET"} ${path} expected error ${expectedCode}, got ${JSON.stringify(payload)}`);
+}
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
@@ -154,6 +173,51 @@ assert(afterReversal.data.movements[0].type === "REVERSAL", "Reversal movement w
 
 const search = await call(`/materials?${new URLSearchParams({ q: `Smoke Material ${suffix}`, craftType: "GENERAL", color: "Smoke Brown", stockState: "in_stock" })}`);
 assert(search.meta.total >= 1, "Material search did not find the smoke-test material");
+
+// ---- 项目状态流转：阶段门、回退原因、一次性自动推进、版本并发控制 ----
+let projectState = await call(`/projects/${project.data.id}`);
+assert(projectState.data.autoStartedAt, "Auto-start timestamp was not recorded");
+
+// 阶段门：消耗已撤销，没有有效消耗记录时不能完成项目
+await expectError(`/projects/${project.data.id}/status`, { method: "POST", body: { status: "COMPLETED", version: projectState.data.version } }, 409, "GATE_CONSUMPTIONS_MISSING");
+
+// 回退必须填写回退原因
+await expectError(`/projects/${project.data.id}/status`, { method: "POST", body: { status: "PLANNED", version: projectState.data.version } }, 422, "ROLLBACK_REASON_REQUIRED");
+await call(`/projects/${project.data.id}/status`, { method: "POST", body: { status: "PLANNED", version: projectState.data.version, reason: "Smoke 回退验证" } });
+
+// 自动推进只能触发一次：退回计划后再记录消耗会被拒绝
+await expectError("/consumptions", { method: "POST", body: { ...consumptionPayload, usedQuantity: "10", wasteQuantity: "0" } }, 409, "AUTO_START_ALREADY_USED");
+
+// 手动开始项目（阶段门：已有材料需求，放行）
+projectState = await call(`/projects/${project.data.id}`);
+await call(`/projects/${project.data.id}/status`, { method: "POST", body: { status: "IN_PROGRESS", version: projectState.data.version } });
+
+// 并发变更按版本拒绝覆盖
+await expectError(`/projects/${project.data.id}`, { method: "PATCH", body: { name: `Smoke Project ${suffix} Renamed`, version: projectState.data.version - 1 } }, 409, "VERSION_CONFLICT");
+await expectError(`/projects/${project.data.id}/status`, { method: "POST", body: { status: "COMPLETED", version: projectState.data.version - 1 } }, 409, "VERSION_CONFLICT");
+
+// 手动开始后可以继续消耗
+const secondConsumption = await call("/consumptions", { method: "POST", body: { ...consumptionPayload, usedQuantity: "100", wasteQuantity: "0" } });
+assert(secondConsumption.data.totalQuantity === "100.000000", "Second consumption total is incorrect");
+const afterSecondConsumption = await call(`/batches/${batch.id}`);
+assert(afterSecondConsumption.data.remainingQuantity === "900.000000", "Batch balance after second consumption is incorrect");
+
+// 阶段门：有有效消耗后可以完成项目
+projectState = await call(`/projects/${project.data.id}`);
+await call(`/projects/${project.data.id}/status`, { method: "POST", body: { status: "COMPLETED", version: projectState.data.version } });
+
+// 已完成项目禁止新增需求
+await expectError(`/projects/${project.data.id}/requirements`, { method: "POST", body: { materialId: material.data.id, requiredQuantity: "10", unit: "g" } }, 409, "PROJECT_READ_ONLY");
+
+// 完成前的旧版本号不再被接受
+await expectError(`/projects/${project.data.id}/status`, { method: "POST", body: { status: "IN_PROGRESS", version: projectState.data.version, reason: "过期版本重试" } }, 409, "VERSION_CONFLICT");
+
+// 状态流转历史：自动推进只记录一次，回退原因已保存
+projectState = await call(`/projects/${project.data.id}`);
+const transitions = projectState.data.statusTransitions;
+assert(transitions.filter((item) => item.triggerType === "AUTO").length === 1, "Auto-advance was recorded more than once");
+const rollback = transitions.find((item) => item.fromStatus === "IN_PROGRESS" && item.toStatus === "PLANNED");
+assert(rollback && rollback.reason === "Smoke 回退验证", "Rollback reason was not recorded");
 
 console.log(JSON.stringify({
   result: "PASS",
