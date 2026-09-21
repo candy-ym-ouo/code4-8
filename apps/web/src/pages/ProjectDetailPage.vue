@@ -15,6 +15,11 @@ const materials = ref<Material[]>([]);
 const requirementVisible = ref(false);
 const requirementForm = reactive({ materialId: "", requiredQuantity: "", unit: "g", purpose: "", notes: "" });
 const isReadOnly = computed(() => ["COMPLETED", "ARCHIVED"].includes(project.value?.status));
+const backwardTargets: Record<string, string> = { PLANNED: "", IN_PROGRESS: "PLANNED", COMPLETED: "IN_PROGRESS", ARCHIVED: "" };
+const transitionKindLabels: Record<string, string> = { FORWARD: "阶段推进", BACKWARD: "状态回退", ARCHIVE: "归档", AUTO_START: "自动开始" };
+const transitionKindType: Record<string, "success" | "warning" | "info" | "primary"> = {
+  FORWARD: "success", BACKWARD: "warning", ARCHIVE: "info", AUTO_START: "primary"
+};
 
 async function load() {
   loading.value = true;
@@ -52,11 +57,36 @@ async function deleteRequirement(id: string) {
 }
 async function changeStatus(status: string) {
   const label = statusLabels[status] || status;
+  const backwardTarget = backwardTargets[project.value.status] ?? "";
+  const isBackward = status === backwardTarget && backwardTarget !== "";
   try {
-    if (status === "COMPLETED") await ElMessageBox.confirm("完成后项目默认只读，重新打开后才能继续消耗。", "完成项目", { type: "warning" });
-    await request(`/projects/${project.value.id}/status`, { method: "POST", body: { status, version: project.value.version } });
+    const body: { status: string; version: number; reason?: string; skipGate?: boolean } = { status, version: project.value.version };
+    if (isBackward) {
+      const { value } = await ElMessageBox.prompt("状态回退后需要重新走阶段门，请填写回退原因。", `回退到${label}`, {
+        type: "warning",
+        inputType: "textarea",
+        inputPlaceholder: "例如：材料缺货，项目暂停",
+        inputValidator: (value: string) => value.trim().length >= 3 || "回退原因至少 3 个字符"
+      });
+      body.reason = value.trim();
+    } else if (status === "COMPLETED") {
+      await ElMessageBox.confirm("完成后项目默认只读，重新打开需要填写回退原因。", "完成项目", { type: "warning" });
+    }
+    try {
+      await request(`/projects/${project.value.id}/status`, { method: "POST", body });
+    } catch (error) {
+      // 阶段门未通过时，允许显式跳过并再试一次
+      if (error instanceof ApiError && ["GATE_NO_CONSUMPTION", "GATE_DUE_DATE_PASSED"].includes(error.code)) {
+        await ElMessageBox.confirm(`${error.message}；确认要跳过阶段门强制${label}吗？`, "阶段门未通过", { type: "warning" });
+        await request(`/projects/${project.value.id}/status`, { method: "POST", body: { ...body, skipGate: true } });
+      } else {
+        throw error;
+      }
+    }
     ElMessage.success(`项目状态已更新为${label}`); await load();
-  } catch (error: any) { if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof ApiError ? error.message : "状态更新失败"); }
+  } catch (error: any) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof ApiError ? error.message : "状态更新失败");
+  }
 }
 onMounted(load);
 </script>
@@ -65,10 +95,17 @@ onMounted(load);
   <div v-loading="loading">
     <template v-if="project">
       <header class="page-header">
-        <div><h1>{{ project.name }}</h1><p>{{ craftTypeLabels[project.craftType] || project.craftType }} · {{ statusLabels[project.status] || project.status }}</p></div>
+        <div>
+          <h1>
+            {{ project.name }}
+            <el-tag v-if="project.autoStarted" size="small" type="primary" effect="plain">首次消耗自动开始</el-tag>
+          </h1>
+          <p>{{ craftTypeLabels[project.craftType] || project.craftType }} · {{ statusLabels[project.status] || project.status }}</p>
+        </div>
         <div>
           <el-button :disabled="isReadOnly" @click="router.push(`/projects/${project.id}/edit`)">编辑</el-button>
           <el-button v-if="project.status==='PLANNED'" type="primary" @click="changeStatus('IN_PROGRESS')">开始项目</el-button>
+          <el-button v-if="project.status==='IN_PROGRESS'" type="warning" plain @click="changeStatus('PLANNED')">退回计划中</el-button>
           <el-button v-if="project.status==='IN_PROGRESS'" type="success" @click="changeStatus('COMPLETED')">完成项目</el-button>
           <el-button v-if="project.status==='COMPLETED'" @click="changeStatus('IN_PROGRESS')">重新打开</el-button>
           <el-button :disabled="isReadOnly" type="primary" plain @click="router.push({ path: '/consumptions', query: { projectId: project.id, create: '1' } })">记录消耗</el-button>
@@ -96,6 +133,20 @@ onMounted(load);
           <el-table-column label="操作" width="110"><template #default="{ row }"><el-button link type="danger" :disabled="row.referenceCount>0 || isReadOnly" @click="deleteRequirement(row.id)">删除</el-button></template></el-table-column>
         </el-table>
         <el-empty v-if="project.requirements.length===0" description="还没有计划用料" />
+      </section>
+
+      <section class="panel">
+        <h2>状态流转</h2>
+        <el-timeline v-if="project.statusHistory?.length">
+          <el-timeline-item v-for="entry in project.statusHistory" :key="entry.id" :timestamp="new Date(entry.createdAt).toLocaleString()" :type="transitionKindType[entry.transitionKind]">
+            <el-tag size="small" :type="transitionKindType[entry.transitionKind]">{{ transitionKindLabels[entry.transitionKind] || entry.transitionKind }}</el-tag>
+            <strong>{{ entry.fromStatus ? statusLabels[entry.fromStatus] || entry.fromStatus : "—" }} → {{ statusLabels[entry.toStatus] || entry.toStatus }}</strong>
+            <span v-if="entry.actorName" class="muted">· {{ entry.actorName }}</span>
+            <el-tag v-if="entry.gateSkipped" size="small" type="danger" effect="plain" style="margin-left:8px">跳过阶段门</el-tag>
+            <div v-if="entry.reason" class="muted">回退原因：{{ entry.reason }}</div>
+          </el-timeline-item>
+        </el-timeline>
+        <el-empty v-else description="还没有状态流转记录" />
       </section>
 
       <AttachmentPanel owner-type="PROJECT" :owner-id="project.id" :attachments="project.attachments" @changed="load" />

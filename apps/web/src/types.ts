@@ -86,7 +86,20 @@ export type Project = {
   requirementCount: number;
   consumptionCount: number;
   version: number;
+  autoStarted: boolean;
+  statusHistory?: ProjectStatusHistoryEntry[];
   updatedAt: string;
+};
+
+export type ProjectStatusHistoryEntry = {
+  id: string;
+  fromStatus: string | null;
+  toStatus: string;
+  transitionKind: "FORWARD" | "BACKWARD" | "ARCHIVE" | "AUTO_START";
+  reason: string | null;
+  gateSkipped: boolean;
+  actorName: string | null;
+  createdAt: string;
 };
 
 export type Consumption = {

@@ -145,11 +145,41 @@
 | --- | --- | --- |
 | GET/POST | `/projects` | 查询或创建项目 |
 | GET/PATCH | `/projects/:id` | 详情或更新 |
-| POST | `/projects/:id/status` | 更新状态 |
-| POST | `/projects/:id/archive` | 归档 |
+| POST | `/projects/:id/status` | 状态流转（阶段门 + 乐观锁） |
+| GET | `/projects/:id/status-history` | 状态流转历史（含回退原因） |
+| POST | `/projects/:id/archive` | 归档（body 可选携带 `version`） |
 | POST | `/projects/:id/requirements` | 添加材料需求 |
-| PATCH | `/projects/:id/requirements/:requirementId` | 更新需求 |
+| PATCH | `/projects/:id/requirements/:requirementId` | 更新需求（携带需求 `version`） |
 | DELETE | `/projects/:id/requirements/:requirementId` | 删除未使用需求 |
+
+### 6.1 状态阶段门
+
+状态只能按下表流转，跨阶段跳转（如 `PLANNED` 直接到 `COMPLETED`）返回 `INVALID_STATUS_TRANSITION`；归档必须走 `/archive` 接口；`ARCHIVED` 为终态：
+
+| 当前状态 | 允许的目标状态 |
+| --- | --- |
+| `PLANNED` | `IN_PROGRESS` |
+| `IN_PROGRESS` | `COMPLETED`、`PLANNED`（回退） |
+| `COMPLETED` | `IN_PROGRESS`（回退）、`ARCHIVED` |
+| `ARCHIVED` | 无 |
+
+前进阶段门：开始项目时截止日期不能早于当天（`GATE_DUE_DATE_PASSED`）；完成项目时必须至少存在一条有效（未撤销）的材料消耗（`GATE_NO_CONSUMPTION`）。确需强制推进时可传 `"skipGate": true`，该次流转会在历史中标记“跳过阶段门”。
+
+回退（`IN_PROGRESS → PLANNED`、`COMPLETED → IN_PROGRESS`）必须提供至少 3 个字符的 `reason`，否则返回 `REASON_REQUIRED`；原因与操作人记入状态流转历史。
+
+状态流转请求：
+
+```json
+{
+  "status": "PLANNED",
+  "version": 3,
+  "reason": "材料缺货，项目暂停"
+}
+```
+
+并发变更：所有流转都要携带项目当前 `version`，版本不匹配返回 `409 VERSION_CONFLICT`，服务端拒绝覆盖，调用方需刷新后重试。更新材料需求同样携带该需求的 `version`。
+
+已完成或已归档项目为只读：不能新增、修改或删除材料需求，也不能继续记录消耗。
 
 材料需求：
 
@@ -170,7 +200,7 @@
 | GET | `/consumptions/:id` | 消耗详情 |
 | POST | `/consumptions/:id/reverse` | 撤销 |
 
-首次为计划中的项目创建消耗时，项目会自动转为 `IN_PROGRESS` 并记录审计日志。
+首次为计划中的项目创建消耗时，项目会自动转为 `IN_PROGRESS` 并记录审计日志与状态历史（`AUTO_START`）。该自动推进每个项目只触发一次：若项目被手动回退到 `PLANNED`，之后再记录消耗不会再次自动开始，需要显式调用状态接口开始项目。
 
 创建消耗：
 

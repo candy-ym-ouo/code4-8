@@ -7,6 +7,7 @@ import { pageMeta, parsePagination } from "../lib/pagination.js";
 import { parseInput } from "../lib/validation.js";
 import { writeAudit } from "../lib/audit.js";
 import { getIdempotencyKey } from "../lib/idempotency.js";
+import { insertStatusHistory } from "../lib/projectStatus.js";
 
 type Query = Record<string, string | undefined>;
 
@@ -100,8 +101,8 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
         if (existing.rows[0]) return { ...existing.rows[0], idempotent: true };
       }
 
-      const project = await client.query<{ id: string; name: string; status: string; version: number; start_date: string | null; due_date: string | null }>(
-        "SELECT id, name, status, version, start_date, due_date FROM projects WHERE id = $1 FOR UPDATE",
+      const project = await client.query<{ id: string; name: string; status: string; version: number; start_date: string | null; due_date: string | null; auto_started: boolean }>(
+        "SELECT id, name, status, version, start_date, due_date, auto_started FROM projects WHERE id = $1 FOR UPDATE",
         [input.projectId]
       );
       if (!project.rows[0]) throw new AppError(422, "INVALID_PROJECT", "项目不存在");
@@ -109,7 +110,8 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
         throw new AppError(409, "PROJECT_READ_ONLY", "已完成或已归档项目不能继续消耗材料");
       }
       let autoStartedProject = false;
-      if (project.rows[0].status === "PLANNED") {
+      // 自动推进只能触发一次：项目被手动回退到计划中后，再次记录消耗不再自动开始
+      if (project.rows[0].status === "PLANNED" && !project.rows[0].auto_started) {
         if (!project.rows[0].start_date && project.rows[0].due_date) {
           const today = await client.query<{ today: string }>("SELECT current_date::text AS today");
           if (project.rows[0].due_date < (today.rows[0]?.today ?? project.rows[0].due_date)) {
@@ -118,19 +120,30 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
         }
         const started = await client.query(
           `UPDATE projects SET status = 'IN_PROGRESS', start_date = coalesce(start_date, current_date),
-             version = version + 1 WHERE id = $1 RETURNING *`,
+             auto_started = true, version = version + 1
+           WHERE id = $1 AND status = 'PLANNED' AND auto_started = false RETURNING *`,
           [input.projectId]
         );
-        autoStartedProject = true;
-        await writeAudit(client, {
-          actorUserId: user.id,
-          action: "AUTO_START",
-          entityType: "PROJECT",
-          entityId: input.projectId,
-          beforeData: project.rows[0],
-          afterData: started.rows[0],
-          requestId: request.id
-        });
+        if (started.rows[0]) {
+          autoStartedProject = true;
+          await insertStatusHistory(client, {
+            projectId: input.projectId,
+            fromStatus: "PLANNED",
+            toStatus: "IN_PROGRESS",
+            kind: "AUTO_START",
+            actorUserId: user.id,
+            requestId: request.id
+          });
+          await writeAudit(client, {
+            actorUserId: user.id,
+            action: "AUTO_START",
+            entityType: "PROJECT",
+            entityId: input.projectId,
+            beforeData: project.rows[0],
+            afterData: started.rows[0],
+            requestId: request.id
+          });
+        }
       }
 
       const batchResult = await client.query<{

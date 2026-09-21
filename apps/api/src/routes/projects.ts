@@ -7,10 +7,15 @@ import { AppError } from "../lib/errors.js";
 import { pageMeta, parsePagination } from "../lib/pagination.js";
 import { parseInput } from "../lib/validation.js";
 import { writeAudit } from "../lib/audit.js";
+import { assertTransitionAllowed, checkPhaseGate, insertStatusHistory, listStatusHistory, transitionKind } from "../lib/projectStatus.js";
 
 type Query = Record<string, string | undefined>;
 const projectPatchSchema = projectInputSchema.partial().extend({ version: z.number().int().positive() });
-const requirementPatchSchema = requirementInputSchema.partial().extend({ version: z.number().int().positive().optional() });
+const requirementPatchSchema = requirementInputSchema
+  .partial()
+  .extend({ version: z.number().int().positive() })
+  .refine((value) => Object.keys(value).length > 1, "至少提供一个可更新字段");
+const archiveSchema = z.object({ version: z.number().int().positive().optional() });
 
 function dateOnly(value: unknown): string | null {
   if (value === null || value === undefined) return null;
@@ -67,7 +72,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       `SELECT id, name, craft_type AS "craftType", status, start_date AS "startDate", due_date AS "dueDate",
               completed_at AS "completedAt", description, target_color_name AS "targetColorName",
               target_color_hex AS "targetColorHex", tags, archived_at AS "archivedAt",
-              created_at AS "createdAt", updated_at AS "updatedAt", version
+              created_at AS "createdAt", updated_at AS "updatedAt", version, auto_started AS "autoStarted"
          FROM projects WHERE id = $1`,
       [request.params.id]
     );
@@ -75,6 +80,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const requirements = await pool.query(
       `SELECT r.id, r.material_id AS "materialId", m.name AS "materialName", m.stock_unit AS "materialStockUnit",
               r.required_quantity::text AS "requiredQuantity", r.stock_unit AS "stockUnit", r.purpose, r.notes,
+              r.version,
               coalesce(sum(c.total_quantity) FILTER (WHERE c.status = 'ACTIVE'), 0)::text AS "actualQuantity",
               coalesce(sum(c.used_quantity) FILTER (WHERE c.status = 'ACTIVE'), 0)::text AS "usedQuantity",
               coalesce(sum(c.waste_quantity) FILTER (WHERE c.status = 'ACTIVE'), 0)::text AS "wasteQuantity",
@@ -111,7 +117,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         [request.params.id]
       )
     ]);
-    return { data: { ...project.rows[0], requirements: requirements.rows, consumptions: consumptions.rows, colorChanges: colors.rows, attachments: attachments.rows } };
+    return { data: { ...project.rows[0], requirements: requirements.rows, consumptions: consumptions.rows, colorChanges: colors.rows, attachments: attachments.rows, statusHistory: await listStatusHistory(pool, request.params.id) } };
   });
 
   app.post("/projects", async (request, reply) => {
@@ -192,45 +198,84 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (!old) throw new AppError(404, "NOT_FOUND", "项目不存在");
       if (old.version !== input.version) throw new AppError(409, "VERSION_CONFLICT", "项目已被其他操作修改，请刷新后重试");
       if (old.status === input.status) return { data: old };
-      if (old.status === "ARCHIVED" && input.status !== "ARCHIVED") throw new AppError(409, "PROJECT_ARCHIVED", "已归档项目不能直接重新打开");
-      if (input.status === "ARCHIVED" && old.status === "IN_PROGRESS") {
-        throw new AppError(409, "PROJECT_IN_PROGRESS", "进行中的项目不能归档");
+      if (old.status === "ARCHIVED") throw new AppError(409, "PROJECT_ARCHIVED", "已归档项目不能变更状态");
+
+      assertTransitionAllowed(old.status, input.status);
+      const kind = transitionKind(old.status, input.status);
+      if (kind === "BACKWARD" && !input.reason) {
+        throw new AppError(422, "REASON_REQUIRED", "状态回退必须填写回退原因", { reason: ["请填写回退原因"] });
       }
-      if (["IN_PROGRESS", "COMPLETED"].includes(input.status)) {
-        const startDate = dateOnly(old.start_date);
-        if (!startDate) {
-          const today = await client.query<{ today: string }>("SELECT current_date::text AS today");
-          const dueDate = dateOnly(old.due_date);
-          if (dueDate && dueDate < (today.rows[0]?.today ?? dueDate)) {
-            throw new AppError(422, "INVALID_PROJECT_DATES", "请先调整截止日期，再开始或完成项目");
-          }
-        }
+
+      let gateSkipped = false;
+      if (kind === "FORWARD" && !input.skipGate) {
+        const gateFailure = await checkPhaseGate(client, old, input.status);
+        if (gateFailure) throw new AppError(409, gateFailure.code, gateFailure.message);
+      } else if (kind === "FORWARD" && input.skipGate) {
+        gateSkipped = true;
       }
+
       const result = await client.query(
         `UPDATE projects SET status = $1::project_status,
           start_date = CASE WHEN $1 IN ('IN_PROGRESS', 'COMPLETED') THEN coalesce(start_date, current_date) ELSE start_date END,
           completed_at = CASE WHEN $1 = 'COMPLETED' THEN now() WHEN $1 IN ('PLANNED', 'IN_PROGRESS') THEN NULL ELSE completed_at END,
-          archived_at = CASE WHEN $1 = 'ARCHIVED' THEN now() ELSE archived_at END,
           version = version + 1
          WHERE id = $2 RETURNING *`,
         [input.status, request.params.id]
       );
-      await writeAudit(client, { actorUserId: user.id, action: "STATUS", entityType: "PROJECT", entityId: request.params.id, beforeData: old, afterData: result.rows[0], requestId: request.id });
+      await insertStatusHistory(client, {
+        projectId: request.params.id,
+        fromStatus: old.status,
+        toStatus: input.status,
+        kind,
+        reason: input.reason ?? null,
+        gateSkipped,
+        actorUserId: user.id,
+        requestId: request.id
+      });
+      await writeAudit(client, {
+        actorUserId: user.id,
+        action: "STATUS",
+        entityType: "PROJECT",
+        entityId: request.params.id,
+        beforeData: { status: old.status, version: old.version },
+        afterData: { ...result.rows[0], transitionKind: kind, reason: input.reason ?? null, gateSkipped },
+        requestId: request.id
+      });
       return { data: result.rows[0] };
     });
   });
 
   app.post<{ Params: { id: string } }>("/projects/:id/archive", async (request) => {
+    const input = parseInput(archiveSchema, request.body ?? {});
     const user = (request as AuthenticatedRequest).authUser;
     return withTransaction(async (client) => {
       const before = await client.query("SELECT * FROM projects WHERE id = $1 FOR UPDATE", [request.params.id]);
-      if (!before.rows[0]) throw new AppError(404, "NOT_FOUND", "项目不存在");
-      if (before.rows[0].status === "ARCHIVED") return { data: before.rows[0] };
-      if (before.rows[0].status === "IN_PROGRESS") throw new AppError(409, "PROJECT_IN_PROGRESS", "进行中的项目不能归档");
+      const old = before.rows[0];
+      if (!old) throw new AppError(404, "NOT_FOUND", "项目不存在");
+      if (input.version !== undefined && old.version !== input.version) {
+        throw new AppError(409, "VERSION_CONFLICT", "项目已被其他操作修改，请刷新后重试");
+      }
+      if (old.status === "ARCHIVED") return { data: old };
+      if (old.status === "IN_PROGRESS") throw new AppError(409, "PROJECT_IN_PROGRESS", "进行中的项目不能归档");
       const result = await client.query("UPDATE projects SET status = 'ARCHIVED', archived_at = now(), version = version + 1 WHERE id = $1 RETURNING *", [request.params.id]);
-      await writeAudit(client, { actorUserId: user.id, action: "ARCHIVE", entityType: "PROJECT", entityId: request.params.id, afterData: result.rows[0], requestId: request.id });
+      await insertStatusHistory(client, {
+        projectId: request.params.id,
+        fromStatus: old.status,
+        toStatus: "ARCHIVED",
+        kind: "ARCHIVE",
+        actorUserId: user.id,
+        requestId: request.id
+      });
+      await writeAudit(client, { actorUserId: user.id, action: "ARCHIVE", entityType: "PROJECT", entityId: request.params.id, beforeData: old, afterData: result.rows[0], requestId: request.id });
       return { data: result.rows[0] };
     });
+  });
+
+  app.get<{ Params: { id: string } }>("/projects/:id/status-history", async (request) => {
+    const project = await pool.query("SELECT 1 FROM projects WHERE id = $1", [request.params.id]);
+    if (!project.rowCount) throw new AppError(404, "NOT_FOUND", "项目不存在");
+    const history = await listStatusHistory(pool, request.params.id);
+    return { data: history };
   });
 
   app.post<{ Params: { id: string } }>("/projects/:id/requirements", async (request, reply) => {
@@ -272,6 +317,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const before = await client.query("SELECT * FROM project_requirements WHERE id = $1 AND project_id = $2 FOR UPDATE", [request.params.requirementId, request.params.id]);
       const old = before.rows[0];
       if (!old) throw new AppError(404, "NOT_FOUND", "材料需求不存在");
+      if (old.version !== input.version) {
+        throw new AppError(409, "VERSION_CONFLICT", "材料需求已被其他操作修改，请刷新后重试");
+      }
       const materialId = input.materialId ?? old.material_id;
       const materialChanged = materialId !== old.material_id;
       if (materialChanged) {
@@ -301,7 +349,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const result = await client.query(
         `UPDATE project_requirements SET material_id = $1, required_quantity = $2, stock_unit = $3::stock_unit,
           purpose = CASE WHEN $4::boolean THEN $5 ELSE purpose END,
-          notes = CASE WHEN $6::boolean THEN $7 ELSE notes END
+          notes = CASE WHEN $6::boolean THEN $7 ELSE notes END,
+          version = version + 1
          WHERE id = $8 RETURNING *`,
         [materialId, requiredQuantity, material.rows[0].stock_unit, "purpose" in input, input.purpose || null, "notes" in input, input.notes || null, request.params.requirementId]
       );

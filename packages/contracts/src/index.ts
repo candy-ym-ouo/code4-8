@@ -25,6 +25,32 @@ export type MovementType = (typeof movementTypes)[number];
 export const projectStatuses = ["PLANNED", "IN_PROGRESS", "COMPLETED", "ARCHIVED"] as const;
 export type ProjectStatus = (typeof projectStatuses)[number];
 
+/**
+ * 阶段门：允许的项目状态流转。
+ * 计划中只能开始；进行中可完成或回退到计划中；已完成可重新打开或归档；已归档为终态。
+ */
+export const projectStatusTransitions = {
+  PLANNED: ["IN_PROGRESS"],
+  IN_PROGRESS: ["COMPLETED", "PLANNED"],
+  COMPLETED: ["IN_PROGRESS", "ARCHIVED"],
+  ARCHIVED: []
+} as const satisfies Record<ProjectStatus, readonly ProjectStatus[]>;
+
+export const projectStatusRank: Record<ProjectStatus, number> = {
+  PLANNED: 0,
+  IN_PROGRESS: 1,
+  COMPLETED: 2,
+  ARCHIVED: 3
+};
+
+export const projectTransitionReasons = {
+  FORWARD: "FORWARD",
+  BACKWARD: "BACKWARD",
+  ARCHIVE: "ARCHIVE",
+  AUTO_START: "AUTO_START"
+} as const;
+export type ProjectTransitionKind = (typeof projectTransitionReasons)[keyof typeof projectTransitionReasons];
+
 export const colorChangeTypes = [
   "OXIDATION",
   "DYE_BATH",
@@ -248,10 +274,20 @@ export const reverseConsumptionSchema = z.object({
   reason: z.string().trim().min(3).max(1000)
 });
 
-export const projectStatusSchema = z.object({
-  status: z.enum(projectStatuses),
-  version: z.number().int().positive()
-});
+export const projectStatusSchema = z
+  .object({
+    status: z.enum(projectStatuses),
+    version: z.number().int().positive(),
+    /** 回退（进行中→计划中、已完成→重新打开）时必须填写原因 */
+    reason: z.string().trim().min(3, "回退原因至少 3 个字符").max(500).optional(),
+    /** 跳过阶段门前置检查需要显式确认 */
+    skipGate: z.boolean().optional()
+  })
+  // 目标为 PLANNED 一定是回退（PLANNED 只能由 IN_PROGRESS 退回）
+  .refine((value) => value.status !== "PLANNED" || Boolean(value.reason), {
+    message: "退回计划中必须填写回退原因",
+    path: ["reason"]
+  });
 
 export type Pagination = {
   page: number;
